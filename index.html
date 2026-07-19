@@ -15,6 +15,9 @@
 <link href="https://fonts.googleapis.com" rel="preconnect"/>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&amp;family=Plus+Jakarta+Sans:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet"/>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <style>
   :root {
     --bg: #FDFDFB;
@@ -281,6 +284,7 @@
 </head>
 <body>
 <div class="wrap">
+<div id="cloudBanner" style="display:none; background:#FEE2E2; border:1px solid #FCA5A5; color:#7F1D1D; padding:16px 24px; border-radius:20px; margin-bottom:24px; font-size:13.5px; line-height:1.6;"></div>
 <header>
   <div>
     <p class="eyebrow">Dashboard Pertumbuhan</p>
@@ -499,7 +503,11 @@
     </div>
     <div class="panel">
       <h2 class="section-title" style="font-size:22px;">Manajemen Data</h2>
-      <p style="font-size:14px; color:var(--ink-soft); margin-bottom:32px;">Ekspor atau impor seluruh data aktivitas Anda.</p>
+      <p style="font-size:14px; color:var(--ink-soft); margin-bottom:20px;">Ekspor atau impor seluruh data aktivitas Anda.</p>
+      <div class="settings-row" style="padding-top:0;">
+        <span style="font-weight:600;">Status Cloud Sync</span>
+        <span id="cloudStatusBadge" class="badge">Mengecek…</span>
+      </div>
       <div style="display:flex; gap:16px; flex-wrap:wrap;">
         <button class="btn" id="exportBtn" style="flex:1;">Ekspor JSON</button>
         <label class="btn ghost" style="flex:1; cursor:pointer; text-align:center;">Impor Data<input accept=".json" id="importFile" style="display:none;" type="file"/></label>
@@ -592,12 +600,88 @@ let customWork = [], customSoul = [], checks = {}, targets = [];
 let settings = {reminderOn:false, morningTime:'07:00', eveningTime:'20:30', weddingDate:'', lastFiredMorning:'', lastFiredEvening:''};
 let taskWeeklyChartInst = null, activityDailyChartInst = null;
 
-/* ================= STORAGE ================= */
-async function safeGet(key){ try{ const r = await window.storage.get(key,false); return r ? JSON.parse(r.value) : null; }catch(e){ return null; } }
-async function safeSet(key, value){ try{ await window.storage.set(key, JSON.stringify(value), false); }catch(e){ console.error('set failed',key,e); } }
-async function safeList(prefix){ try{ const r = await window.storage.list(prefix,false); return r ? r.keys : []; }catch(e){ return []; } }
-async function rawGet(key){ try{ return await window.storage.get(key,false); }catch(e){ return null; } }
-async function rawSet(key, rawValue){ try{ await window.storage.set(key, rawValue, false); }catch(e){} }
+/* ================= CLOUD SYNC (FIREBASE FIRESTORE) ================= */
+// PENTING: isi 6 nilai di bawah ini dengan konfigurasi dari project Firebase-mu sendiri.
+// Cara mendapatkannya ada di FIREBASE-SETUP.md. Tanpa ini, data TIDAK akan tersinkron antar device.
+const firebaseConfig = {
+  apiKey: "AIzaSyCLBwRc2CIszBEFuK0HnU3kz60s8Er4mDA",
+  authDomain: "diary-31f69.firebaseapp.com",
+  projectId: "diary-31f69",
+  storageBucket: "diary-31f69.firebasestorage.app",
+  messagingSenderId: "264534206338",
+  appId: "1:264534206338:web:4f28ab55bbb81e073fd19b",
+  measurementId: "G-W5C0E0GQ4L"
+};
+
+const FIREBASE_CONFIGURED = !!(firebaseConfig.apiKey && !firebaseConfig.apiKey.includes('PASTE'));
+
+let db = null;
+let firebaseReadyPromise = Promise.resolve();
+if (FIREBASE_CONFIGURED) {
+  firebase.initializeApp(firebaseConfig);
+  db = firebase.firestore();
+  db.enablePersistence({ synchronizeTabs: true }).catch((err) => console.warn('Offline cache tidak aktif:', err.code));
+  firebaseReadyPromise = firebase.auth().signInAnonymously().catch((err) => console.error('Sign-in gagal', err));
+} else {
+  console.warn('Firebase belum dikonfigurasi — data TIDAK akan tersinkron antar device. Lihat FIREBASE-SETUP.md');
+}
+
+function showCloudBanner() {
+  const el = document.getElementById('cloudBanner');
+  if (!FIREBASE_CONFIGURED) {
+    el.style.display = 'block';
+    el.innerHTML = '⚠️ <strong>Cloud Sync belum diaktifkan.</strong> Data hanya tersimpan sementara di memori tab ini dan akan hilang saat direfresh, serta tidak sinkron antar device. Ikuti <code>FIREBASE-SETUP.md</code> untuk mengaktifkan sinkronisasi otomatis.';
+  } else {
+    el.style.display = 'none';
+  }
+}
+
+/* ================= STORAGE (via Firestore, koleksi "kv") ================= */
+async function safeGet(key) {
+  if (!db) return null;
+  try {
+    await firebaseReadyPromise;
+    const snap = await db.collection('kv').doc(key).get();
+    if (!snap.exists) return null;
+    const raw = snap.data().value;
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) { console.error('get failed', key, e); return null; }
+}
+async function safeSet(key, value) {
+  if (!db) return;
+  try {
+    await firebaseReadyPromise;
+    await db.collection('kv').doc(key).set({ value: JSON.stringify(value), updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+  } catch (e) { console.error('set failed', key, e); }
+}
+async function safeList(prefix) {
+  if (!db) return [];
+  try {
+    await firebaseReadyPromise;
+    const end = prefix + '\uf8ff';
+    const q = await db.collection('kv')
+      .where(firebase.firestore.FieldPath.documentId(), '>=', prefix)
+      .where(firebase.firestore.FieldPath.documentId(), '<', end)
+      .get();
+    return q.docs.map((d) => d.id);
+  } catch (e) { console.error('list failed', prefix, e); return []; }
+}
+async function rawGet(key) {
+  if (!db) return null;
+  try {
+    await firebaseReadyPromise;
+    const snap = await db.collection('kv').doc(key).get();
+    if (!snap.exists) return null;
+    return { value: snap.data().value };
+  } catch (e) { return null; }
+}
+async function rawSet(key, rawValue) {
+  if (!db) return;
+  try {
+    await firebaseReadyPromise;
+    await db.collection('kv').doc(key).set({ value: rawValue, updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+  } catch (e) {}
+}
 
 function showToast(msg){
   const t = document.getElementById('toast');
@@ -1023,6 +1107,14 @@ function loadSettings(){
   const note = document.getElementById('notifSupportNote');
   if(!('Notification' in window)) note.textContent = 'Browser ini tidak mendukung notifikasi — gunakan Google Tasks/Calendar sebagai cadangan.';
   else note.textContent = 'Izin browser saat ini: ' + Notification.permission;
+  const cloudBadge = document.getElementById('cloudStatusBadge');
+  if(FIREBASE_CONFIGURED && db){
+    cloudBadge.textContent = '☁️ Tersambung — sinkron antar device';
+    cloudBadge.style.background = '#D1FAE5'; cloudBadge.style.color = '#065F46';
+  } else {
+    cloudBadge.textContent = '⚠️ Belum dikonfigurasi';
+    cloudBadge.style.background = '#FEE2E2'; cloudBadge.style.color = '#7F1D1D';
+  }
 }
 document.getElementById('reminderSwitch').onclick = async () => {
   if(!('Notification' in window)){ showToast('Notifikasi tidak didukung di browser ini'); return; }
@@ -1139,6 +1231,8 @@ if('serviceWorker' in navigator){
 
 /* ================= INIT ================= */
 (async function init(){
+  showCloudBanner();
+  await firebaseReadyPromise;
   customWork = (await safeGet(CUSTOM_WORK_KEY)) || [];
   customSoul = (await safeGet(CUSTOM_SOUL_KEY)) || [];
   checks = (await safeGet(CHECK_KEY)) || {};
